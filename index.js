@@ -186,6 +186,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   try {
+    if (!interaction.guild) {
+      await interaction.reply({
+        content: 'This command only works inside a server, not in a DM — try it in a text channel of a server I\'m in.',
+        ephemeral: true,
+      });
+      return;
+    }
+
     if (interaction.commandName === 'gdp') {
       const counter = getCounter(interaction.guild.id);
       const totalMembers = interaction.guild.memberCount;
@@ -215,22 +223,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
+      const namedRows = rows.map((row) => {
+        const guild = client.guilds.cache.get(row.guild_id);
+        return { ...row, name: guild ? guild.name : row.guild_id };
+      });
+
+      const table = buildComparisonTable(namedRows);
+      const chartUrl = buildGdpChartUrl(namedRows);
+
       const embed = new EmbedBuilder()
         .setTitle('🌐 Global Mock-Gov Economic Overview')
-        .setDescription('Latest weekly snapshot per tracked server, ranked by estimated GDP.')
+        .setDescription('Latest weekly snapshot per tracked server, ranked by estimated GDP.\n' + table)
+        .setImage(chartUrl)
         .setColor(0x9b59b6)
         .setTimestamp();
-
-      for (const row of rows) {
-        const guild = client.guilds.cache.get(row.guild_id);
-        const name = guild ? guild.name : row.guild_id;
-        embed.addFields({
-          name: `${name} (week of ${row.week_start})`,
-          value:
-            `GDP: **${row.gdp.toFixed(2)}** | Members: ${row.total_members} | Active: ${row.active_members} | ` +
-            `Joins: ${row.new_joins} | Messages: ${row.messages} | Money: ${row.money_supply ?? 'not set'}`,
-        });
-      }
 
       await interaction.reply({ embeds: [embed] });
     }
@@ -291,6 +297,54 @@ process.on('unhandledRejection', (err) => {
 process.on('uncaughtException', (err) => {
   console.error('Uncaught exception:', err);
 });
+
+// Builds a monospaced, aligned comparison table (Discord renders ```...``` as fixed-width).
+function buildComparisonTable(namedRows) {
+  const cols = ['Server', 'GDP', 'Members', 'Active', 'Joins', 'Messages', 'Money'];
+  const data = namedRows.map((r) => [
+    truncate(r.name, 16),
+    r.gdp.toFixed(1),
+    `${r.total_members}`,
+    `${r.active_members}`,
+    `${r.new_joins}`,
+    `${r.messages}`,
+    r.money_supply != null ? `${r.money_supply}` : '—',
+  ]);
+
+  const widths = cols.map((c, i) => Math.max(c.length, ...data.map((row) => row[i].length)));
+  const pad = (s, w) => s + ' '.repeat(w - s.length);
+
+  const header = cols.map((c, i) => pad(c, widths[i])).join(' | ');
+  const separator = widths.map((w) => '-'.repeat(w)).join('-|-');
+  const lines = data.map((row) => row.map((v, i) => pad(v, widths[i])).join(' | '));
+
+  return '```\n' + [header, separator, ...lines].join('\n') + '\n```';
+}
+
+function truncate(s, max) {
+  return s.length > max ? s.slice(0, max - 1) + '…' : s;
+}
+
+// Builds a QuickChart.io URL for a bar chart of GDP per server — no local rendering needed.
+function buildGdpChartUrl(namedRows) {
+  const config = {
+    type: 'bar',
+    data: {
+      labels: namedRows.map((r) => truncate(r.name, 14)),
+      datasets: [{
+        label: 'Estimated GDP',
+        data: namedRows.map((r) => Number(r.gdp.toFixed(2))),
+        backgroundColor: '#9b59b6',
+      }],
+    },
+    options: {
+      plugins: { legend: { display: false } },
+      title: { display: true, text: 'Mock-Gov GDP Comparison' },
+    },
+  };
+  const encoded = encodeURIComponent(JSON.stringify(config));
+  return `https://quickchart.io/chart?c=${encoded}&width=600&height=350&backgroundColor=white`;
+}
 
 function latestSnapshot(guildId) {
   return db.prepare(`
