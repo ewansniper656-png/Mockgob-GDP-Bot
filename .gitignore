@@ -1,0 +1,5 @@
+node_modules
+.env
+gdp.db
+gdp.db-shm
+gdp.db-wal
