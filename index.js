@@ -18,6 +18,8 @@ require('dotenv').config();
 // ---------- CONFIG ----------
 const K_CONSTANT = 1;          // productivity calibration constant, keep identical across all servers you compare
 const REPORT_CHANNEL_NAME = 'gdp-report'; // bot will post weekly report here if the channel exists
+const HISTORY_CHANNEL_NAME = 'gdp-history'; // bot will post the daily GDP evolution chart here if the channel exists
+const HISTORY_DAYS_SHOWN = 30; // how many days of history the daily chart displays
 // -----------------------------
 
 // Uses /data/gdp.db if a persistent volume is mounted there (e.g. on Railway),
@@ -44,6 +46,18 @@ CREATE TABLE IF NOT EXISTS money_supply (
   guild_id TEXT PRIMARY KEY,
   amount INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS daily_history (
+  guild_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  gdp REAL,
+  total_members INTEGER,
+  active_members INTEGER,
+  messages INTEGER,
+  new_joins INTEGER,
+  money_supply INTEGER,
+  PRIMARY KEY (guild_id, date)
 );
 `);
 
@@ -106,12 +120,86 @@ cron.schedule('5 0 * * 0', async () => {
   await snapshotAllGuilds();
 }, { timezone: 'UTC' });
 
-// Computes current stats for one guild and upserts today's-week snapshot row.
-// Does NOT reset live counters — safe to call anytime (e.g. right after /setmoney),
-// not just during the weekly cron reset.
-function refreshSnapshotForGuild(guild) {
+// ---------- Daily history + chart job ----------
+// Runs every day at 00:10 UTC. Records one data point per guild, then posts an
+// updated GDP-evolution line chart to any channel named HISTORY_CHANNEL_NAME.
+cron.schedule('10 0 * * *', async () => {
+  await recordDailyHistoryAndPostChart();
+}, { timezone: 'UTC' });
+
+async function recordDailyHistoryAndPostChart() {
+  for (const [, guild] of client.guilds.cache) {
+    recordDailyHistoryForGuild(guild);
+  }
+
+  const chartUrl = buildHistoryChartUrl();
+  if (!chartUrl) return; // no history yet
+
+  for (const [, guild] of client.guilds.cache) {
+    const channel = guild.channels.cache.find(
+      (ch) => ch.name === HISTORY_CHANNEL_NAME && ch.isTextBased()
+    );
+    if (!channel) continue;
+
+    const embed = new EmbedBuilder()
+      .setTitle('📉 GDP Evolution — Last ' + HISTORY_DAYS_SHOWN + ' Days')
+      .setImage(chartUrl)
+      .setColor(0xe67e22)
+      .setTimestamp();
+
+    channel.send({ embeds: [embed] }).catch(() => {});
+  }
+}
+
+// Pulls the last HISTORY_DAYS_SHOWN days of history for every guild and builds
+// a multi-line QuickChart URL (one line per server).
+function buildHistoryChartUrl() {
+  const rows = db.prepare(`
+    SELECT * FROM daily_history
+    WHERE date >= date('now', '-${HISTORY_DAYS_SHOWN} days')
+    ORDER BY date ASC
+  `).all();
+
+  if (rows.length === 0) return null;
+
+  // Collect the sorted set of unique dates (shared x-axis) and unique guilds (one line each).
+  const dates = [...new Set(rows.map((r) => r.date))].sort();
+  const guildIds = [...new Set(rows.map((r) => r.guild_id))];
+
+  const colors = ['#9b59b6', '#3498db', '#2ecc71', '#e67e22', '#e74c3c', '#1abc9c', '#f1c40f', '#34495e'];
+
+  const datasets = guildIds.map((guildId, i) => {
+    const guild = client.guilds.cache.get(guildId);
+    const name = guild ? truncate(guild.name, 18) : guildId;
+    const byDate = new Map(rows.filter((r) => r.guild_id === guildId).map((r) => [r.date, r.gdp]));
+    return {
+      label: name,
+      data: dates.map((d) => (byDate.has(d) ? Number(byDate.get(d).toFixed(2)) : null)),
+      borderColor: colors[i % colors.length],
+      backgroundColor: colors[i % colors.length],
+      fill: false,
+      spanGaps: true,
+    };
+  });
+
+  const config = {
+    type: 'line',
+    data: { labels: dates, datasets },
+    options: {
+      title: { display: true, text: 'Mock-Gov GDP Evolution' },
+      scales: {
+        xAxes: [{ ticks: { autoSkip: true, maxTicksLimit: 10 } }],
+      },
+    },
+  };
+
+  const encoded = encodeURIComponent(JSON.stringify(config));
+  return `https://quickchart.io/chart?c=${encoded}&width=700&height=400&backgroundColor=white`;
+}
+
+// Pure computation of current live stats for one guild (no DB write).
+function computeGuildStats(guild) {
   const guildId = guild.id;
-  const weekStart = isoWeekStart();
   const counter = getCounter(guildId);
   const totalMembers = guild.memberCount;
   const activeMembers = counter.activeSenders.size;
@@ -123,13 +211,40 @@ function refreshSnapshotForGuild(guild) {
 
   const gdp = computeGDP({ messages, activeMembers, totalMembers, newJoins });
 
+  return { totalMembers, activeMembers, messages, newJoins, moneySupply, gdp };
+}
+
+// Computes current stats for one guild and upserts today's-week snapshot row.
+// Does NOT reset live counters — safe to call anytime (e.g. right after /setmoney),
+// not just during the weekly cron reset.
+function refreshSnapshotForGuild(guild) {
+  const guildId = guild.id;
+  const weekStart = isoWeekStart();
+  const stats = computeGuildStats(guild);
+
   db.prepare(`
     INSERT OR REPLACE INTO weekly_snapshot
     (guild_id, week_start, total_members, active_members, messages, new_joins, money_supply, gdp)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(guildId, weekStart, totalMembers, activeMembers, messages, newJoins, moneySupply, gdp);
+  `).run(guildId, weekStart, stats.totalMembers, stats.activeMembers, stats.messages, stats.newJoins, stats.moneySupply, stats.gdp);
 
-  return { totalMembers, activeMembers, messages, newJoins, moneySupply, gdp };
+  return stats;
+}
+
+// Records one day's GDP data point for one guild — independent of the weekly snapshot,
+// used to build the day-by-day evolution chart. Does not reset counters either.
+function recordDailyHistoryForGuild(guild) {
+  const guildId = guild.id;
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+  const stats = computeGuildStats(guild);
+
+  db.prepare(`
+    INSERT OR REPLACE INTO daily_history
+    (guild_id, date, gdp, total_members, active_members, messages, new_joins, money_supply)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(guildId, today, stats.gdp, stats.totalMembers, stats.activeMembers, stats.messages, stats.newJoins, stats.moneySupply);
+
+  return stats;
 }
 
 async function snapshotAllGuilds() {
@@ -172,6 +287,9 @@ async function registerCommands(clientId) {
     new SlashCommandBuilder()
       .setName('globalstats')
       .setDescription('Show latest weekly snapshot for every server this bot tracks (usable from any server)'),
+    new SlashCommandBuilder()
+      .setName('gdphistory')
+      .setDescription('Show the GDP evolution chart across tracked servers right now'),
     new SlashCommandBuilder()
       .setName('setmoney')
       .setDescription('Manually set this server\'s total money supply (from your economy bot)')
@@ -244,6 +362,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setDescription('Latest weekly snapshot per tracked server, ranked by estimated GDP.\n' + table)
         .setImage(chartUrl)
         .setColor(0x9b59b6)
+        .setTimestamp();
+
+      await interaction.reply({ embeds: [embed] });
+    }
+
+    if (interaction.commandName === 'gdphistory') {
+      // Ensure today's data point exists for this server so the chart includes it even
+      // before the nightly cron has run yet today.
+      recordDailyHistoryForGuild(interaction.guild);
+
+      const chartUrl = buildHistoryChartUrl();
+      if (!chartUrl) {
+        await interaction.reply('No GDP history recorded yet — check back after the next daily update, or once a few days have passed.');
+        return;
+      }
+
+      const embed = new EmbedBuilder()
+        .setTitle(`📉 GDP Evolution — Last ${HISTORY_DAYS_SHOWN} Days`)
+        .setImage(chartUrl)
+        .setColor(0xe67e22)
         .setTimestamp();
 
       await interaction.reply({ embeds: [embed] });
