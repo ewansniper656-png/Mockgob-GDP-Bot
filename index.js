@@ -368,9 +368,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.commandName === 'gdphistory') {
-      // Ensure today's data point exists for this server so the chart includes it even
-      // before the nightly cron has run yet today.
-      recordDailyHistoryForGuild(interaction.guild);
+      // Ensure today's data point exists for every tracked server (not just this one)
+      // so the chart is complete even before the nightly cron has run yet today.
+      for (const [, guild] of client.guilds.cache) {
+        recordDailyHistoryForGuild(guild);
+      }
 
       const chartUrl = buildHistoryChartUrl();
       if (!chartUrl) {
