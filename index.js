@@ -24,7 +24,7 @@ const REPORT_CHANNEL_NAME = 'gdp-report'; // bot will post weekly report here if
 // otherwise falls back to a local gdp.db file for local/dev use.
 const fs = require('fs');
 const dbPath = fs.existsSync('/data') ? '/data/gdp.db' : 'gdp.db';
-const db = new Database(dbPath);
+const db = new Database('/data/gdp.db');
 db.pragma('journal_mode = WAL');
 
 db.exec(`
