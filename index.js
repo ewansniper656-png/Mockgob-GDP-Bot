@@ -106,30 +106,38 @@ cron.schedule('5 0 * * 0', async () => {
   await snapshotAllGuilds();
 }, { timezone: 'UTC' });
 
-async function snapshotAllGuilds() {
+// Computes current stats for one guild and upserts today's-week snapshot row.
+// Does NOT reset live counters — safe to call anytime (e.g. right after /setmoney),
+// not just during the weekly cron reset.
+function refreshSnapshotForGuild(guild) {
+  const guildId = guild.id;
   const weekStart = isoWeekStart();
-  for (const [guildId, guild] of client.guilds.cache) {
-    const counter = getCounter(guildId);
-    const totalMembers = guild.memberCount;
-    const activeMembers = counter.activeSenders.size;
-    const messages = counter.messages;
-    const newJoins = counter.newJoins;
+  const counter = getCounter(guildId);
+  const totalMembers = guild.memberCount;
+  const activeMembers = counter.activeSenders.size;
+  const messages = counter.messages;
+  const newJoins = counter.newJoins;
 
-    const moneyRow = db.prepare('SELECT amount FROM money_supply WHERE guild_id = ?').get(guildId);
-    const moneySupply = moneyRow ? moneyRow.amount : null;
+  const moneyRow = db.prepare('SELECT amount FROM money_supply WHERE guild_id = ?').get(guildId);
+  const moneySupply = moneyRow ? moneyRow.amount : null;
 
-    const gdp = computeGDP({ messages, activeMembers, totalMembers, newJoins });
+  const gdp = computeGDP({ messages, activeMembers, totalMembers, newJoins });
 
-    db.prepare(`
-      INSERT OR REPLACE INTO weekly_snapshot
-      (guild_id, week_start, total_members, active_members, messages, new_joins, money_supply, gdp)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(guildId, weekStart, totalMembers, activeMembers, messages, newJoins, moneySupply, gdp);
+  db.prepare(`
+    INSERT OR REPLACE INTO weekly_snapshot
+    (guild_id, week_start, total_members, active_members, messages, new_joins, money_supply, gdp)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(guildId, weekStart, totalMembers, activeMembers, messages, newJoins, moneySupply, gdp);
 
-    await postReport(guild, { totalMembers, activeMembers, messages, newJoins, moneySupply, gdp });
+  return { totalMembers, activeMembers, messages, newJoins, moneySupply, gdp };
+}
 
-    // reset counters for the new week
-    liveCounters.set(guildId, { messages: 0, activeSenders: new Set(), newJoins: 0 });
+async function snapshotAllGuilds() {
+  for (const [, guild] of client.guilds.cache) {
+    const stats = refreshSnapshotForGuild(guild);
+    await postReport(guild, stats);
+    // reset counters for the new week (only done here, on the weekly cron — not on /setmoney refreshes)
+    liveCounters.set(guild.id, { messages: 0, activeSenders: new Set(), newJoins: 0 });
   }
 }
 
@@ -248,7 +256,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         VALUES (?, ?, datetime('now'))
         ON CONFLICT(guild_id) DO UPDATE SET amount = excluded.amount, updated_at = excluded.updated_at
       `).run(interaction.guild.id, amount);
-      await interaction.reply(`Money supply for this server set to **${amount}**.`);
+
+      // Immediately refresh this server's snapshot so /globalstats and /exchangerate
+      // reflect the new money supply right away, instead of waiting for Sunday's cron.
+      refreshSnapshotForGuild(interaction.guild);
+
+      await interaction.reply(`Money supply for this server set to **${amount}**. Global stats updated immediately.`);
     }
 
     if (interaction.commandName === 'exchangerate') {
