@@ -24,7 +24,7 @@ const REPORT_CHANNEL_NAME = 'gdp-report'; // bot will post weekly report here if
 // otherwise falls back to a local gdp.db file for local/dev use.
 const fs = require('fs');
 const dbPath = fs.existsSync('/data') ? '/data/gdp.db' : 'gdp.db';
-const db = new Database('/data/gdp.db');
+const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 
 db.exec(`
@@ -185,88 +185,111 @@ async function registerCommands(clientId) {
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  if (interaction.commandName === 'gdp') {
-    const counter = getCounter(interaction.guild.id);
-    const totalMembers = interaction.guild.memberCount;
-    const activeMembers = counter.activeSenders.size;
-    const messages = counter.messages;
-    const newJoins = counter.newJoins;
-    const gdp = computeGDP({ messages, activeMembers, totalMembers, newJoins });
+  try {
+    if (interaction.commandName === 'gdp') {
+      const counter = getCounter(interaction.guild.id);
+      const totalMembers = interaction.guild.memberCount;
+      const activeMembers = counter.activeSenders.size;
+      const messages = counter.messages;
+      const newJoins = counter.newJoins;
+      const gdp = computeGDP({ messages, activeMembers, totalMembers, newJoins });
 
-    const embed = new EmbedBuilder()
-      .setTitle(`📈 Live stats — ${interaction.guild.name} (week in progress)`)
-      .addFields(
-        { name: 'Total Members', value: `${totalMembers}`, inline: true },
-        { name: 'Active Members (so far)', value: `${activeMembers}`, inline: true },
-        { name: 'New Joins (so far)', value: `${newJoins}`, inline: true },
-        { name: 'Messages (so far)', value: `${messages}`, inline: true },
-        { name: 'Estimated GDP (so far)', value: `${gdp.toFixed(2)}`, inline: true },
-      )
-      .setColor(0x3498db);
+      const embed = new EmbedBuilder()
+        .setTitle(`📈 Live stats — ${interaction.guild.name} (week in progress)`)
+        .addFields(
+          { name: 'Total Members', value: `${totalMembers}`, inline: true },
+          { name: 'Active Members (so far)', value: `${activeMembers}`, inline: true },
+          { name: 'New Joins (so far)', value: `${newJoins}`, inline: true },
+          { name: 'Messages (so far)', value: `${messages}`, inline: true },
+          { name: 'Estimated GDP (so far)', value: `${gdp.toFixed(2)}`, inline: true },
+        )
+        .setColor(0x3498db);
 
-    await interaction.reply({ embeds: [embed] });
-  }
-
-  if (interaction.commandName === 'globalstats') {
-    const rows = latestSnapshotAllGuilds();
-    if (rows.length === 0) {
-      await interaction.reply('No weekly snapshots recorded yet — wait for the next Sunday snapshot, or check /gdp for live in-progress numbers per server.');
-      return;
+      await interaction.reply({ embeds: [embed] });
     }
 
-    const embed = new EmbedBuilder()
-      .setTitle('🌐 Global Mock-Gov Economic Overview')
-      .setDescription('Latest weekly snapshot per tracked server, ranked by estimated GDP.')
-      .setColor(0x9b59b6)
-      .setTimestamp();
+    if (interaction.commandName === 'globalstats') {
+      const rows = latestSnapshotAllGuilds();
+      if (rows.length === 0) {
+        await interaction.reply('No weekly snapshots recorded yet — wait for the next Sunday snapshot, or check /gdp for live in-progress numbers per server.');
+        return;
+      }
 
-    for (const row of rows) {
-      const guild = client.guilds.cache.get(row.guild_id);
-      const name = guild ? guild.name : row.guild_id;
-      embed.addFields({
-        name: `${name} (week of ${row.week_start})`,
-        value:
-          `GDP: **${row.gdp.toFixed(2)}** | Members: ${row.total_members} | Active: ${row.active_members} | ` +
-          `Joins: ${row.new_joins} | Messages: ${row.messages} | Money: ${row.money_supply ?? 'not set'}`,
-      });
+      const embed = new EmbedBuilder()
+        .setTitle('🌐 Global Mock-Gov Economic Overview')
+        .setDescription('Latest weekly snapshot per tracked server, ranked by estimated GDP.')
+        .setColor(0x9b59b6)
+        .setTimestamp();
+
+      for (const row of rows) {
+        const guild = client.guilds.cache.get(row.guild_id);
+        const name = guild ? guild.name : row.guild_id;
+        embed.addFields({
+          name: `${name} (week of ${row.week_start})`,
+          value:
+            `GDP: **${row.gdp.toFixed(2)}** | Members: ${row.total_members} | Active: ${row.active_members} | ` +
+            `Joins: ${row.new_joins} | Messages: ${row.messages} | Money: ${row.money_supply ?? 'not set'}`,
+        });
+      }
+
+      await interaction.reply({ embeds: [embed] });
     }
 
-    await interaction.reply({ embeds: [embed] });
-  }
-
-  if (interaction.commandName === 'setmoney') {
-    const amount = interaction.options.getInteger('amount');
-    db.prepare(`
-      INSERT INTO money_supply (guild_id, amount, updated_at)
-      VALUES (?, ?, datetime('now'))
-      ON CONFLICT(guild_id) DO UPDATE SET amount = excluded.amount, updated_at = excluded.updated_at
-    `).run(interaction.guild.id, amount);
-    await interaction.reply(`Money supply for this server set to **${amount}**.`);
-  }
-
-  if (interaction.commandName === 'exchangerate') {
-    const targetId = interaction.options.getString('target_guild_id');
-    const a = latestSnapshot(interaction.guild.id);
-    const b = latestSnapshot(targetId);
-
-    if (!a || !b) {
-      await interaction.reply('Missing a weekly snapshot for one of the two servers — wait for the next weekly report, or use /gdp then try again after the next Sunday snapshot.');
-      return;
-    }
-    if (!a.money_supply || !b.money_supply) {
-      await interaction.reply('Both servers need a money supply set via /setmoney before an exchange rate can be computed.');
-      return;
+    if (interaction.commandName === 'setmoney') {
+      const amount = interaction.options.getInteger('amount');
+      db.prepare(`
+        INSERT INTO money_supply (guild_id, amount, updated_at)
+        VALUES (?, ?, datetime('now'))
+        ON CONFLICT(guild_id) DO UPDATE SET amount = excluded.amount, updated_at = excluded.updated_at
+      `).run(interaction.guild.id, amount);
+      await interaction.reply(`Money supply for this server set to **${amount}**.`);
     }
 
-    const valuePerUnitA = a.gdp / a.money_supply;
-    const valuePerUnitB = b.gdp / b.money_supply;
-    const rate = valuePerUnitA / valuePerUnitB; // 1 unit of A currency = `rate` units of B currency
+    if (interaction.commandName === 'exchangerate') {
+      const targetId = interaction.options.getString('target_guild_id');
+      const a = latestSnapshot(interaction.guild.id);
+      const b = latestSnapshot(targetId);
 
-    await interaction.reply(
-      `Estimated exchange rate: **1 currency unit here ≈ ${rate.toFixed(4)} currency units** in the target server ` +
-      `(based on last snapshot: GDP ${a.gdp.toFixed(1)} vs ${b.gdp.toFixed(1)}, money supply ${a.money_supply} vs ${b.money_supply}).`
-    );
+      if (!a || !b) {
+        await interaction.reply('Missing a weekly snapshot for one of the two servers — wait for the next weekly report, or use /gdp then try again after the next Sunday snapshot.');
+        return;
+      }
+      if (!a.money_supply || !b.money_supply) {
+        await interaction.reply('Both servers need a money supply set via /setmoney before an exchange rate can be computed.');
+        return;
+      }
+
+      const valuePerUnitA = a.gdp / a.money_supply;
+      const valuePerUnitB = b.gdp / b.money_supply;
+      const rate = valuePerUnitA / valuePerUnitB; // 1 unit of A currency = `rate` units of B currency
+
+      await interaction.reply(
+        `Estimated exchange rate: **1 currency unit here ≈ ${rate.toFixed(4)} currency units** in the target server ` +
+        `(based on last snapshot: GDP ${a.gdp.toFixed(1)} vs ${b.gdp.toFixed(1)}, money supply ${a.money_supply} vs ${b.money_supply}).`
+      );
+    }
+  } catch (err) {
+    console.error('Error handling interaction:', err);
+    const errorMsg = 'Something went wrong running that command — check the bot logs for details.';
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.followUp({ content: errorMsg, ephemeral: true });
+      } else {
+        await interaction.reply({ content: errorMsg, ephemeral: true });
+      }
+    } catch (_) {
+      // If even the error reply fails, just log it — don't let it crash the process.
+      console.error('Failed to send error reply to Discord.');
+    }
   }
+});
+
+// Safety net: never let an unexpected error crash the whole bot process.
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled promise rejection:', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
 });
 
 function latestSnapshot(guildId) {
