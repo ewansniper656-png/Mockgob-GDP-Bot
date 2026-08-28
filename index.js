@@ -95,10 +95,49 @@ const client = new Client({
   ],
 });
 
-client.once(Events.ClientReady, (c) => {
+client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
   console.log(`Tracking ${c.guilds.cache.size} guild(s): ${[...c.guilds.cache.values()].map(g => g.name).join(', ')}`);
   registerCommands(c.user.id);
+
+  // Self-healing catch-up: if today's daily-history data point is missing for any
+  // guild (e.g. because the container restarted right at the scheduled cron time
+  // and the tick was skipped), record it now instead of waiting until tomorrow.
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    let ranCatchUp = false;
+    for (const [, guild] of c.guilds.cache) {
+      const existing = db.prepare(
+        'SELECT 1 FROM daily_history WHERE guild_id = ? AND date = ?'
+      ).get(guild.id, today);
+      if (!existing) {
+        console.log(`[startup-catchup] missing today's history for ${guild.name}, recording now`);
+        ranCatchUp = true;
+      }
+    }
+    if (ranCatchUp) {
+      await recordDailyHistoryAndPostChart();
+    }
+  } catch (err) {
+    console.error('[startup-catchup] failed:', err);
+  }
+
+  // Same self-healing idea for the weekly snapshot: if this week's row is missing
+  // for any guild, take it now rather than waiting for next Sunday.
+  try {
+    const weekStart = isoWeekStart();
+    for (const [, guild] of c.guilds.cache) {
+      const existing = db.prepare(
+        'SELECT 1 FROM weekly_snapshot WHERE guild_id = ? AND week_start = ?'
+      ).get(guild.id, weekStart);
+      if (!existing) {
+        console.log(`[startup-catchup] missing this week's snapshot for ${guild.name}, recording now`);
+        refreshSnapshotForGuild(guild);
+      }
+    }
+  } catch (err) {
+    console.error('[startup-catchup] weekly check failed:', err);
+  }
 });
 
 // Count a message without reading its content
