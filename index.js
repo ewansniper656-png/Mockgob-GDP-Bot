@@ -575,11 +575,17 @@ async function registerCommands(clientId) {
       ),
     new SlashCommandBuilder()
       .setName('exchangerate')
-      .setDescription('Estimate an exchange rate between this server and another tracked server')
+      .setDescription('Estimate an exchange rate between two tracked servers')
       .addStringOption((opt) =>
         opt.setName('target_guild')
-          .setDescription('The other server (start typing to pick from a list)')
+          .setDescription('The first server (start typing to pick from a list)')
           .setRequired(true)
+          .setAutocomplete(true)
+      )
+      .addStringOption((opt) =>
+        opt.setName('source_guild')
+          .setDescription('The second server — leave blank to use the server you\'re in right now')
+          .setRequired(false)
           .setAutocomplete(true)
       ),
   ].map((c) => c.toJSON());
@@ -591,10 +597,17 @@ async function registerCommands(clientId) {
 client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.isAutocomplete()) {
     if (interaction.commandName === 'exchangerate') {
-      const focused = interaction.options.getFocused().toLowerCase();
+      const focusedOption = interaction.options.getFocused(true); // { name, value }
+      const focusedText = focusedOption.value.toLowerCase();
+
+      // Whatever's already typed/picked in the OTHER field, so we can avoid suggesting
+      // the same server for both sides of the comparison.
+      const otherFieldName = focusedOption.name === 'target_guild' ? 'source_guild' : 'target_guild';
+      const otherValue = interaction.options.getString(otherFieldName);
+
       const choices = [...client.guilds.cache.values()]
-        .filter((g) => g.id !== interaction.guildId) // exclude the current server
-        .filter((g) => g.name.toLowerCase().includes(focused))
+        .filter((g) => g.id !== otherValue)
+        .filter((g) => g.name.toLowerCase().includes(focusedText))
         .slice(0, 25) // Discord's max autocomplete results
         .map((g) => ({ name: g.name, value: g.id }));
 
@@ -717,7 +730,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.commandName === 'exchangerate') {
       const targetId = interaction.options.getString('target_guild');
-      const a = latestSnapshot(interaction.guild.id);
+      const sourceId = interaction.options.getString('source_guild') || interaction.guild.id;
+
+      if (sourceId === targetId) {
+        await interaction.reply('Pick two different servers to compare — both fields point to the same one right now.');
+        return;
+      }
+
+      const a = latestSnapshot(sourceId);
       const b = latestSnapshot(targetId);
 
       if (!a || !b) {
@@ -732,11 +752,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const valuePerUnitA = a.gdp / a.money_supply;
       const valuePerUnitB = b.gdp / b.money_supply;
       const rate = valuePerUnitA / valuePerUnitB; // 1 unit of A currency = `rate` units of B currency
+
+      const sourceGuild = client.guilds.cache.get(sourceId);
       const targetGuild = client.guilds.cache.get(targetId);
+      const sourceName = sourceGuild ? sourceGuild.name : sourceId;
       const targetName = targetGuild ? targetGuild.name : targetId;
 
       await interaction.reply(
-        `Estimated exchange rate: **1 currency unit here ≈ ${rate.toFixed(4)} currency units** in **${targetName}** ` +
+        `Estimated exchange rate: **1 currency unit in ${sourceName} ≈ ${rate.toFixed(4)} currency units in ${targetName}** ` +
         `(based on last snapshot: GDP ${a.gdp.toFixed(1)} vs ${b.gdp.toFixed(1)}, money supply ${a.money_supply} vs ${b.money_supply}).`
       );
     }
