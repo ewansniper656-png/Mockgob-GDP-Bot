@@ -97,6 +97,7 @@ const client = new Client({
 
 client.once(Events.ClientReady, (c) => {
   console.log(`Logged in as ${c.user.tag}`);
+  console.log(`Tracking ${c.guilds.cache.size} guild(s): ${[...c.guilds.cache.values()].map(g => g.name).join(', ')}`);
   registerCommands(c.user.id);
 });
 
@@ -117,23 +118,37 @@ client.on(Events.GuildMemberAdd, (member) => {
 // ---------- Weekly snapshot job ----------
 // Runs every Sunday at 00:05 UTC. Adjust the cron string to taste.
 cron.schedule('5 0 * * 0', async () => {
-  await snapshotAllGuilds();
+  console.log(`[weekly-snapshot] cron fired at ${new Date().toISOString()}`);
+  try {
+    await snapshotAllGuilds();
+  } catch (err) {
+    console.error('[weekly-snapshot] job failed:', err);
+  }
 }, { timezone: 'UTC' });
 
 // ---------- Daily history + chart job ----------
 // Runs every day at 00:10 UTC. Records one data point per guild, then posts an
 // updated GDP-evolution line chart to any channel named HISTORY_CHANNEL_NAME.
 cron.schedule('10 0 * * *', async () => {
-  await recordDailyHistoryAndPostChart();
+  console.log(`[daily-history] cron fired at ${new Date().toISOString()}`);
+  try {
+    await recordDailyHistoryAndPostChart();
+  } catch (err) {
+    console.error('[daily-history] job failed:', err);
+  }
 }, { timezone: 'UTC' });
 
 async function recordDailyHistoryAndPostChart() {
   for (const [, guild] of client.guilds.cache) {
     recordDailyHistoryForGuild(guild);
   }
+  console.log(`[daily-history] recorded data for ${client.guilds.cache.size} guild(s)`);
 
   const chartUrl = buildHistoryChartUrl();
-  if (!chartUrl) return; // no history yet
+  if (!chartUrl) {
+    console.log('[daily-history] no chart built — no history rows yet');
+    return;
+  }
 
   for (const [, guild] of client.guilds.cache) {
     const channel = guild.channels.cache.find(
@@ -147,7 +162,9 @@ async function recordDailyHistoryAndPostChart() {
       .setColor(0xe67e22)
       .setTimestamp();
 
-    channel.send({ embeds: [embed] }).catch(() => {});
+    channel.send({ embeds: [embed] })
+      .then(() => console.log(`[daily-history] posted chart in ${guild.name}#${channel.name}`))
+      .catch((err) => console.error(`[daily-history] failed to post in ${guild.name}#${channel.name}:`, err));
   }
 }
 
