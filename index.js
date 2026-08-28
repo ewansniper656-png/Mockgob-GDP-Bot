@@ -577,7 +577,10 @@ async function registerCommands(clientId) {
       .setName('exchangerate')
       .setDescription('Estimate an exchange rate between this server and another tracked server')
       .addStringOption((opt) =>
-        opt.setName('target_guild_id').setDescription('The other server\'s ID').setRequired(true)
+        opt.setName('target_guild')
+          .setDescription('The other server (start typing to pick from a list)')
+          .setRequired(true)
+          .setAutocomplete(true)
       ),
   ].map((c) => c.toJSON());
 
@@ -586,6 +589,24 @@ async function registerCommands(clientId) {
 }
 
 client.on(Events.InteractionCreate, async (interaction) => {
+  if (interaction.isAutocomplete()) {
+    if (interaction.commandName === 'exchangerate') {
+      const focused = interaction.options.getFocused().toLowerCase();
+      const choices = [...client.guilds.cache.values()]
+        .filter((g) => g.id !== interaction.guildId) // exclude the current server
+        .filter((g) => g.name.toLowerCase().includes(focused))
+        .slice(0, 25) // Discord's max autocomplete results
+        .map((g) => ({ name: g.name, value: g.id }));
+
+      try {
+        await interaction.respond(choices);
+      } catch (err) {
+        console.error('[autocomplete] failed to respond:', err);
+      }
+    }
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   try {
@@ -695,12 +716,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.commandName === 'exchangerate') {
-      const targetId = interaction.options.getString('target_guild_id');
+      const targetId = interaction.options.getString('target_guild');
       const a = latestSnapshot(interaction.guild.id);
       const b = latestSnapshot(targetId);
 
       if (!a || !b) {
-        await interaction.reply('Missing a weekly snapshot for one of the two servers — wait for the next weekly report, or use /gdp then try again after the next Sunday snapshot.');
+        await interaction.reply('Missing a snapshot for one of the two servers — try /gdp or /setmoney in that server first to generate one.');
         return;
       }
       if (!a.money_supply || !b.money_supply) {
@@ -711,9 +732,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const valuePerUnitA = a.gdp / a.money_supply;
       const valuePerUnitB = b.gdp / b.money_supply;
       const rate = valuePerUnitA / valuePerUnitB; // 1 unit of A currency = `rate` units of B currency
+      const targetGuild = client.guilds.cache.get(targetId);
+      const targetName = targetGuild ? targetGuild.name : targetId;
 
       await interaction.reply(
-        `Estimated exchange rate: **1 currency unit here ≈ ${rate.toFixed(4)} currency units** in the target server ` +
+        `Estimated exchange rate: **1 currency unit here ≈ ${rate.toFixed(4)} currency units** in **${targetName}** ` +
         `(based on last snapshot: GDP ${a.gdp.toFixed(1)} vs ${b.gdp.toFixed(1)}, money supply ${a.money_supply} vs ${b.money_supply}).`
       );
     }
