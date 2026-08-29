@@ -557,7 +557,13 @@ async function registerCommands(clientId) {
   const commands = [
     new SlashCommandBuilder()
       .setName('gdp')
-      .setDescription('Show current live-week stats and estimated GDP for this server'),
+      .setDescription('Show current rolling stats and estimated GDP for a server')
+      .addStringOption((opt) =>
+        opt.setName('target_guild')
+          .setDescription('Which server to check — leave blank for the server you\'re in right now')
+          .setRequired(false)
+          .setAutocomplete(true)
+      ),
     new SlashCommandBuilder()
       .setName('globalstats')
       .setDescription('Show latest weekly snapshot for every server this bot tracks (usable from any server)'),
@@ -617,6 +623,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
         console.error('[autocomplete] failed to respond:', err);
       }
     }
+
+    if (interaction.commandName === 'gdp') {
+      const focusedText = interaction.options.getFocused().toLowerCase();
+      const choices = [...client.guilds.cache.values()]
+        .filter((g) => g.name.toLowerCase().includes(focusedText))
+        .slice(0, 25)
+        .map((g) => ({ name: g.name, value: g.id }));
+
+      try {
+        await interaction.respond(choices);
+      } catch (err) {
+        console.error('[autocomplete] failed to respond:', err);
+      }
+    }
     return;
   }
 
@@ -632,10 +652,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.commandName === 'gdp') {
-      const stats = computeGuildStats(interaction.guild);
+      const targetId = interaction.options.getString('target_guild');
+      const guild = targetId ? client.guilds.cache.get(targetId) : interaction.guild;
+
+      if (!guild) {
+        await interaction.reply('I\'m not tracking a server with that ID — pick one from the autocomplete list.');
+        return;
+      }
+
+      const stats = computeGuildStats(guild);
 
       const embed = new EmbedBuilder()
-        .setTitle(`📈 Live stats — ${interaction.guild.name}`)
+        .setTitle(`📈 Live stats — ${guild.name}`)
         .addFields(
           { name: 'Total Members', value: `${stats.totalMembers}`, inline: true },
           { name: 'Active Members (today)', value: `${stats.activeMembers}`, inline: true },
