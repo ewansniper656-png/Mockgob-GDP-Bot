@@ -28,9 +28,14 @@ const MONEY_PERM_BYPASS_USER_IDS = ['487293928715059233']; // these user IDs can
 // -----------------------------
 
 // Uses /data/gdp.db if a persistent volume is mounted there (e.g. on Railway),
-// otherwise falls back to a local gdp.db file for local/dev use.
+// otherwise falls back to a local gdp.db file for local/dev use — but that local
+// file is NOT persistent on most hosts (Railway wipes the container filesystem
+// on every redeploy/restart), so if you see the fallback message below, your
+// data will NOT survive restarts until a volume is correctly attached at /data.
 const fs = require('fs');
-const dbPath = fs.existsSync('/data') ? '/data/gdp.db' : 'gdp.db';
+const usingPersistentVolume = fs.existsSync('/data');
+const dbPath = usingPersistentVolume ? '/data/gdp.db' : 'gdp.db';
+console.log(`[startup] database path: ${dbPath} (persistent volume ${usingPersistentVolume ? 'FOUND — data will survive restarts' : 'NOT FOUND — data will be LOST on every restart/redeploy!'})`);
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 
@@ -81,6 +86,20 @@ CREATE TABLE IF NOT EXISTS live_counter_snapshot (
   active_senders TEXT NOT NULL
 );
 `);
+
+// Diagnostic: log how much pre-existing data was found in the database at startup.
+// If this shows all zeros right after a restart where you expect history, that
+// confirms the database itself reset — almost always a persistent volume problem,
+// not a bug in the tracking logic.
+{
+  const counts = {
+    weekly_snapshot: db.prepare('SELECT COUNT(*) AS c FROM weekly_snapshot').get().c,
+    daily_history: db.prepare('SELECT COUNT(*) AS c FROM daily_history').get().c,
+    daily_activity: db.prepare('SELECT COUNT(*) AS c FROM daily_activity').get().c,
+    money_supply: db.prepare('SELECT COUNT(*) AS c FROM money_supply').get().c,
+  };
+  console.log('[startup] existing row counts:', JSON.stringify(counts));
+}
 
 // In-memory counters for the day currently in progress (since the last midnight-UTC
 // rollover). Finalized into daily_activity at rollover, then reset to zero.
