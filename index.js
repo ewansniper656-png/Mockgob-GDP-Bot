@@ -23,6 +23,8 @@ const REPORT_CHANNEL_NAME = 'gdp-report'; // bot will post weekly report here if
 const HISTORY_CHANNEL_NAME = 'gdp-history'; // bot will post the daily GDP evolution chart here if the channel exists
 const HISTORY_DAYS_SHOWN = 30; // how many days of history the daily chart displays
 const ROLLING_WINDOW_DAYS = 7; // GDP looks back over this many trailing days, sliding daily — no hard weekly reset
+const MONEY_PERM_ROLE_NAME = 'IMB-Permission'; // only members with a role of this exact name can run /setmoney (create this role in any server — any role with this exact name grants access there)
+const MONEY_PERM_BYPASS_USER_IDS = ['487293928715059233']; // these user IDs can always run /setmoney, in any server, regardless of roles
 // -----------------------------
 
 // Uses /data/gdp.db if a persistent volume is mounted there (e.g. on Railway),
@@ -761,14 +763,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return { ...row, name: guild ? guild.name : row.guild_id };
       });
 
-      const table = buildComparisonTable(namedRows);
+      const leaderboard = buildLeaderboard(namedRows);
       const attachment = await buildGdpChartAttachment(namedRows);
 
       const embed = new EmbedBuilder()
         .setTitle('🌐 Global Mock-Gov Economic Overview')
-        .setDescription('Latest weekly snapshot per tracked server, ranked by estimated GDP.\n' + table)
+        .setDescription(leaderboard)
         .setImage(`attachment://${attachment.name}`)
         .setColor(0x9b59b6)
+        .setFooter({ text: `${namedRows.length} server(s) tracked • ranked by estimated GDP` })
         .setTimestamp();
 
       await interaction.reply({ embeds: [embed], files: [attachment] });
@@ -815,6 +818,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.commandName === 'setmoney') {
+      const isBypassed = MONEY_PERM_BYPASS_USER_IDS.includes(interaction.user.id);
+      const hasPermRole = interaction.member.roles.cache.some((r) => r.name === MONEY_PERM_ROLE_NAME);
+      if (!isBypassed && !hasPermRole) {
+        await interaction.reply({
+          content: `You need the **${MONEY_PERM_ROLE_NAME}** role in this server to set the money supply.`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
       const amount = interaction.options.getInteger('amount');
       db.prepare(`
         INSERT INTO money_supply (guild_id, amount, updated_at)
@@ -888,27 +901,22 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught exception:', err);
 });
 
-// Builds a monospaced, aligned comparison table (Discord renders ```...``` as fixed-width).
-function buildComparisonTable(namedRows) {
-  const cols = ['Server', 'GDP', 'Members', 'Active', 'Joins', 'Messages', 'Money'];
-  const data = namedRows.map((r) => [
-    truncate(r.name, 16),
-    r.gdp.toFixed(1),
-    `${r.total_members}`,
-    `${r.active_members}`,
-    `${r.new_joins}`,
-    `${r.messages}`,
-    r.money_supply != null ? `${r.money_supply}` : '—',
-  ]);
+// Builds a ranked, medal-styled leaderboard string for the embed description —
+// reads more naturally than a monospace table and doesn't need name truncation
+// or column-width juggling for long/emoji-heavy server names.
+function buildLeaderboard(namedRows) {
+  const medals = ['🥇', '🥈', '🥉'];
+  const fmt = (n) => (n == null ? '—' : n.toLocaleString());
 
-  const widths = cols.map((c, i) => Math.max(c.length, ...data.map((row) => row[i].length)));
-  const pad = (s, w) => s + ' '.repeat(w - s.length);
-
-  const header = cols.map((c, i) => pad(c, widths[i])).join(' | ');
-  const separator = widths.map((w) => '-'.repeat(w)).join('-|-');
-  const lines = data.map((row) => row.map((v, i) => pad(v, widths[i])).join(' | '));
-
-  return '```\n' + [header, separator, ...lines].join('\n') + '\n```';
+  return namedRows.map((r, i) => {
+    const rank = medals[i] || `**#${i + 1}**`;
+    return (
+      `${rank} **${r.name}**\n` +
+      `> GDP: **${fmt(Math.round(r.gdp))}** • Members: ${fmt(r.total_members)} • ` +
+      `Active today: ${fmt(r.active_members)} • Joins (${ROLLING_WINDOW_DAYS}d): ${fmt(r.new_joins)} • ` +
+      `Messages (${ROLLING_WINDOW_DAYS}d): ${fmt(r.messages)} • Money: ${fmt(r.money_supply)}`
+    );
+  }).join('\n\n');
 }
 
 function truncate(s, max) {
