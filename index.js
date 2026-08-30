@@ -27,14 +27,16 @@ const MONEY_PERM_ROLE_NAME = 'IMB-Permission'; // only members with a role of th
 const MONEY_PERM_BYPASS_USER_IDS = ['487293928715059233']; // these user IDs can always run /setmoney, in any server, regardless of roles
 // -----------------------------
 
-// Uses /data/gdp.db if a persistent volume is mounted there (e.g. on Railway),
-// otherwise falls back to a local gdp.db file for local/dev use — but that local
-// file is NOT persistent on most hosts (Railway wipes the container filesystem
-// on every redeploy/restart), so if you see the fallback message below, your
-// data will NOT survive restarts until a volume is correctly attached at /data.
+// Railway automatically sets RAILWAY_VOLUME_MOUNT_PATH whenever a volume is
+// genuinely attached to this service, whatever path you chose for it in the
+// dashboard — so we use that instead of assuming a hardcoded path like /data.
+// If this variable is missing, no volume is attached to THIS service at all,
+// and anything written to disk will be wiped on every restart/redeploy.
 const fs = require('fs');
-const usingPersistentVolume = fs.existsSync('/data');
-const dbPath = usingPersistentVolume ? '/data/gdp.db' : 'gdp.db';
+const volumeMountPath = process.env.RAILWAY_VOLUME_MOUNT_PATH;
+const usingPersistentVolume = !!volumeMountPath && fs.existsSync(volumeMountPath);
+const dbPath = usingPersistentVolume ? `${volumeMountPath}/gdp.db` : 'gdp.db';
+console.log(`[startup] RAILWAY_VOLUME_MOUNT_PATH=${volumeMountPath || '(not set)'}`);
 console.log(`[startup] database path: ${dbPath} (persistent volume ${usingPersistentVolume ? 'FOUND — data will survive restarts' : 'NOT FOUND — data will be LOST on every restart/redeploy!'})`);
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
