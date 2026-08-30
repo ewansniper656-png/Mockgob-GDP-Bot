@@ -10,6 +10,8 @@ const {
   SlashCommandBuilder,
   REST,
   Routes,
+  AttachmentBuilder,
+  MessageFlags,
 } = require('discord.js');
 const Database = require('better-sqlite3');
 const cron = require('node-cron');
@@ -400,8 +402,14 @@ async function recordDailyHistoryAndPostChart() {
   }
   console.log(`[daily-history] recorded data for ${client.guilds.cache.size} guild(s)`);
 
-  const chartUrl = buildHistoryChartUrl();
-  if (!chartUrl) {
+  let attachment;
+  try {
+    attachment = await buildHistoryChartAttachment();
+  } catch (err) {
+    console.error('[daily-history] chart render failed:', err);
+    return;
+  }
+  if (!attachment) {
     console.log('[daily-history] no chart built — no history rows yet');
     return;
   }
@@ -414,11 +422,11 @@ async function recordDailyHistoryAndPostChart() {
 
     const embed = new EmbedBuilder()
       .setTitle('📉 GDP Evolution — Last ' + HISTORY_DAYS_SHOWN + ' Days')
-      .setImage(chartUrl)
+      .setImage(`attachment://${attachment.name}`)
       .setColor(0xe67e22)
       .setTimestamp();
 
-    channel.send({ embeds: [embed] })
+    channel.send({ embeds: [embed], files: [attachment] })
       .then(() => console.log(`[daily-history] posted chart in ${guild.name}#${channel.name}`))
       .catch((err) => console.error(`[daily-history] failed to post in ${guild.name}#${channel.name}:`, err));
   }
@@ -426,7 +434,24 @@ async function recordDailyHistoryAndPostChart() {
 
 // Pulls the last HISTORY_DAYS_SHOWN days of history for every guild and builds
 // a multi-line QuickChart URL (one line per server).
-function buildHistoryChartUrl() {
+// Posts the chart config to QuickChart's render API and returns the raw PNG bytes.
+// Using a POST + Buffer instead of a GET URL avoids Discord's 2048-char embed image
+// URL limit entirely — the config can grow as large as it needs to (more servers,
+// more days) without ever hitting that ceiling.
+async function renderChartPng(config, width, height) {
+  const response = await fetch('https://quickchart.io/chart', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chart: config, width, height, backgroundColor: 'white', format: 'png' }),
+  });
+  if (!response.ok) {
+    throw new Error(`QuickChart render failed: ${response.status} ${await response.text()}`);
+  }
+  const arrayBuffer = await response.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
+async function buildHistoryChartAttachment() {
   const rows = db.prepare(`
     SELECT * FROM daily_history
     WHERE date >= date('now', '-${HISTORY_DAYS_SHOWN} days')
@@ -466,8 +491,8 @@ function buildHistoryChartUrl() {
     },
   };
 
-  const encoded = encodeURIComponent(JSON.stringify(config));
-  return `https://quickchart.io/chart?c=${encoded}&width=700&height=400&backgroundColor=white`;
+  const buffer = await renderChartPng(config, 700, 400);
+  return new AttachmentBuilder(buffer, { name: 'gdp-history.png' });
 }
 
 // Pure computation of current stats for one guild (no DB write).
@@ -646,7 +671,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.guild) {
       await interaction.reply({
         content: 'This command only works inside a server, not in a DM — try it in a text channel of a server I\'m in.',
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -689,16 +714,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
 
       const table = buildComparisonTable(namedRows);
-      const chartUrl = buildGdpChartUrl(namedRows);
+      const attachment = await buildGdpChartAttachment(namedRows);
 
       const embed = new EmbedBuilder()
         .setTitle('🌐 Global Mock-Gov Economic Overview')
         .setDescription('Latest weekly snapshot per tracked server, ranked by estimated GDP.\n' + table)
-        .setImage(chartUrl)
+        .setImage(`attachment://${attachment.name}`)
         .setColor(0x9b59b6)
         .setTimestamp();
 
-      await interaction.reply({ embeds: [embed] });
+      await interaction.reply({ embeds: [embed], files: [attachment] });
     }
 
     if (interaction.commandName === 'gdphistory') {
@@ -708,19 +733,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
         recordDailyHistoryForGuild(guild);
       }
 
-      const chartUrl = buildHistoryChartUrl();
-      if (!chartUrl) {
+      const attachment = await buildHistoryChartAttachment();
+      if (!attachment) {
         await interaction.reply('No GDP history recorded yet — check back after the next daily update, or once a few days have passed.');
         return;
       }
 
       const embed = new EmbedBuilder()
         .setTitle(`📉 GDP Evolution — Last ${HISTORY_DAYS_SHOWN} Days`)
-        .setImage(chartUrl)
+        .setImage(`attachment://${attachment.name}`)
         .setColor(0xe67e22)
         .setTimestamp();
 
-      await interaction.reply({ embeds: [embed] });
+      await interaction.reply({ embeds: [embed], files: [attachment] });
     }
 
     if (interaction.commandName === 'backfill') {
@@ -796,9 +821,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const errorMsg = 'Something went wrong running that command — check the bot logs for details.';
     try {
       if (interaction.deferred || interaction.replied) {
-        await interaction.followUp({ content: errorMsg, ephemeral: true });
+        await interaction.followUp({ content: errorMsg, flags: MessageFlags.Ephemeral });
       } else {
-        await interaction.reply({ content: errorMsg, ephemeral: true });
+        await interaction.reply({ content: errorMsg, flags: MessageFlags.Ephemeral });
       }
     } catch (_) {
       // If even the error reply fails, just log it — don't let it crash the process.
@@ -842,8 +867,8 @@ function truncate(s, max) {
   return s.length > max ? s.slice(0, max - 1) + '…' : s;
 }
 
-// Builds a QuickChart.io URL for a bar chart of GDP per server — no local rendering needed.
-function buildGdpChartUrl(namedRows) {
+// Renders a bar chart of GDP per server as a PNG attachment (POST-based, no URL length limit).
+async function buildGdpChartAttachment(namedRows) {
   const config = {
     type: 'bar',
     data: {
@@ -859,8 +884,8 @@ function buildGdpChartUrl(namedRows) {
       title: { display: true, text: 'Mock-Gov GDP Comparison' },
     },
   };
-  const encoded = encodeURIComponent(JSON.stringify(config));
-  return `https://quickchart.io/chart?c=${encoded}&width=600&height=350&backgroundColor=white`;
+  const buffer = await renderChartPng(config, 600, 350);
+  return new AttachmentBuilder(buffer, { name: 'gdp-comparison.png' });
 }
 
 function latestSnapshot(guildId) {
