@@ -70,12 +70,52 @@ CREATE TABLE IF NOT EXISTS daily_activity (
   new_joins INTEGER,
   PRIMARY KEY (guild_id, date)
 );
+
+CREATE TABLE IF NOT EXISTS live_counter_snapshot (
+  guild_id TEXT PRIMARY KEY,
+  date TEXT NOT NULL,
+  messages INTEGER NOT NULL,
+  new_joins INTEGER NOT NULL,
+  active_senders TEXT NOT NULL
+);
 `);
 
 // In-memory counters for the day currently in progress (since the last midnight-UTC
 // rollover). Finalized into daily_activity at rollover, then reset to zero.
+// Persisted to live_counter_snapshot on every change so a restart doesn't lose
+// today's partial data — restored from there on startup.
 // guildId -> { messages: number, activeSenders: Set<string>, newJoins: number }
 const liveCounters = new Map();
+
+// Saves the current in-progress-day counters for one guild to disk. Cheap
+// (local SQLite write) — called after every message/join so a restart never
+// loses more than the single event that was mid-flight.
+function persistLiveCounter(guildId) {
+  const counter = getCounter(guildId);
+  db.prepare(`
+    INSERT OR REPLACE INTO live_counter_snapshot (guild_id, date, messages, new_joins, active_senders)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(guildId, todayUTC(), counter.messages, counter.newJoins, JSON.stringify([...counter.activeSenders]));
+}
+
+// Restores today's counters from disk on startup. A saved row from a previous
+// day is intentionally ignored (left at zero) since midnightRollover() already
+// finalized that day — restoring it would double-count it.
+function restoreLiveCounters() {
+  const today = todayUTC();
+  const rows = db.prepare('SELECT * FROM live_counter_snapshot').all();
+  let restoredCount = 0;
+  for (const row of rows) {
+    if (row.date !== today) continue;
+    liveCounters.set(row.guild_id, {
+      messages: row.messages,
+      newJoins: row.new_joins,
+      activeSenders: new Set(JSON.parse(row.active_senders)),
+    });
+    restoredCount++;
+  }
+  console.log(`[startup] restored today's in-progress counters for ${restoredCount} guild(s)`);
+}
 
 function getCounter(guildId) {
   if (!liveCounters.has(guildId)) {
@@ -134,6 +174,10 @@ client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
   console.log(`Tracking ${c.guilds.cache.size} guild(s): ${[...c.guilds.cache.values()].map(g => g.name).join(', ')}`);
   registerCommands(c.user.id);
+
+  // Restore today's in-progress counters before anything else touches them —
+  // otherwise the catch-up logic below would compute stats from empty counters.
+  restoreLiveCounters();
 
   // Self-healing catch-up: if today's daily-history data point is missing for any
   // guild (e.g. because the container restarted right at the scheduled cron time
@@ -200,12 +244,14 @@ client.on(Events.MessageCreate, (message) => {
   const counter = getCounter(message.guild.id);
   counter.messages += 1;
   counter.activeSenders.add(message.author.id);
+  persistLiveCounter(message.guild.id);
 });
 
 // Count new joins
 client.on(Events.GuildMemberAdd, (member) => {
   const counter = getCounter(member.guild.id);
   counter.newJoins += 1;
+  persistLiveCounter(member.guild.id);
 });
 
 // ---------- Retroactive backfill ----------
@@ -298,6 +344,7 @@ async function backfillGuildActivity(guild) {
       activeSenders: perDayActiveSenders.get(today) || new Set(),
       newJoins: perDayJoins.get(today) || 0,
     });
+    persistLiveCounter(guild.id);
 
     // --- Retroactively populate the evolution chart for the backfilled days too ---
     const sortedDates = [...allDates].sort();
@@ -368,6 +415,7 @@ async function midnightRollover() {
     `).run(guild.id, finishedDay, counter.messages, counter.newJoins);
 
     liveCounters.set(guild.id, { messages: 0, activeSenders: new Set(), newJoins: 0 });
+    persistLiveCounter(guild.id);
   }
   console.log(`[midnight-rollover] finalized ${finishedDay} for ${client.guilds.cache.size} guild(s)`);
 }
