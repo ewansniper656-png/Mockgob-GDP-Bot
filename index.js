@@ -60,6 +60,11 @@ CREATE TABLE IF NOT EXISTS money_supply (
   updated_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS guild_settings (
+  guild_id TEXT PRIMARY KEY,
+  history_channel_id TEXT
+);
+
 CREATE TABLE IF NOT EXISTS daily_history (
   guild_id TEXT NOT NULL,
   date TEXT NOT NULL,
@@ -99,6 +104,7 @@ CREATE TABLE IF NOT EXISTS live_counter_snapshot (
     daily_history: db.prepare('SELECT COUNT(*) AS c FROM daily_history').get().c,
     daily_activity: db.prepare('SELECT COUNT(*) AS c FROM daily_activity').get().c,
     money_supply: db.prepare('SELECT COUNT(*) AS c FROM money_supply').get().c,
+    guild_settings: db.prepare('SELECT COUNT(*) AS c FROM guild_settings').get().c,
   };
   console.log('[startup] existing row counts:', JSON.stringify(counts));
 }
@@ -149,6 +155,15 @@ function getCounter(guildId) {
 
 function todayUTC() {
   return new Date().toISOString().slice(0, 10);
+}
+
+// True if this interaction's member is allowed to run IMB-Permission-gated
+// commands: either they hold the configured role in this server, or their
+// user ID is in the bypass list (trusted across every server).
+function hasImbPerm(interaction) {
+  const isBypassed = MONEY_PERM_BYPASS_USER_IDS.includes(interaction.user.id);
+  const hasPermRole = interaction.member.roles.cache.some((r) => r.name === MONEY_PERM_ROLE_NAME);
+  return isBypassed || hasPermRole;
 }
 
 function daysAgoUTC(n) {
@@ -457,7 +472,8 @@ cron.schedule('5 0 * * 0', async () => {
 
 // ---------- Daily history + chart job ----------
 // Runs every day at 00:10 UTC. Records one data point per guild, then posts an
-// updated GDP-evolution line chart to any channel named HISTORY_CHANNEL_NAME.
+// updated GDP-evolution line chart to that guild's configured channel (set via
+// /set-gdp-history), falling back to any channel named HISTORY_CHANNEL_NAME.
 cron.schedule('10 0 * * *', async () => {
   console.log(`[daily-history] cron fired at ${new Date().toISOString()}`);
   try {
@@ -466,6 +482,19 @@ cron.schedule('10 0 * * *', async () => {
     console.error('[daily-history] job failed:', err);
   }
 }, { timezone: 'UTC' });
+
+// Resolves which channel to post the daily chart in for a guild: the explicitly
+// configured channel (via /set-gdp-history) if it still exists and is postable,
+// otherwise falls back to name-matching HISTORY_CHANNEL_NAME for servers that
+// haven't set one explicitly yet.
+function getHistoryChannelForGuild(guild) {
+  const row = db.prepare('SELECT history_channel_id FROM guild_settings WHERE guild_id = ?').get(guild.id);
+  if (row && row.history_channel_id) {
+    const configured = guild.channels.cache.get(row.history_channel_id);
+    if (configured && configured.isTextBased()) return configured;
+  }
+  return guild.channels.cache.find((ch) => ch.name === HISTORY_CHANNEL_NAME && ch.isTextBased()) || null;
+}
 
 async function recordDailyHistoryAndPostChart() {
   for (const [, guild] of client.guilds.cache) {
@@ -486,9 +515,7 @@ async function recordDailyHistoryAndPostChart() {
   }
 
   for (const [, guild] of client.guilds.cache) {
-    const channel = guild.channels.cache.find(
-      (ch) => ch.name === HISTORY_CHANNEL_NAME && ch.isTextBased()
-    );
+    const channel = getHistoryChannelForGuild(guild);
     if (!channel) continue;
 
     const embed = new EmbedBuilder()
@@ -690,6 +717,12 @@ async function registerCommands(clientId) {
           .setRequired(false)
           .setAutocomplete(true)
       ),
+    new SlashCommandBuilder()
+      .setName('server-link')
+      .setDescription('Get the invite link for the IMB server'),
+    new SlashCommandBuilder()
+      .setName('set-gdp-history')
+      .setDescription(`Set this channel as the default daily GDP update channel for this server (requires ${MONEY_PERM_ROLE_NAME} role)`),
   ].map((c) => c.toJSON());
 
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
@@ -838,10 +871,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
     }
 
+    if (interaction.commandName === 'server-link') {
+      await interaction.reply('https://discord.gg/4zYzJrG7n3');
+    }
+
+    if (interaction.commandName === 'set-gdp-history') {
+      if (!hasImbPerm(interaction)) {
+        await interaction.reply({
+          content: `You need the **${MONEY_PERM_ROLE_NAME}** role in this server to set the GDP update channel.`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      db.prepare(`
+        INSERT INTO guild_settings (guild_id, history_channel_id)
+        VALUES (?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET history_channel_id = excluded.history_channel_id
+      `).run(interaction.guild.id, interaction.channel.id);
+
+      await interaction.reply(`This channel is now set as the default daily GDP update channel for **${interaction.guild.name}**.`);
+    }
+
     if (interaction.commandName === 'setmoney') {
-      const isBypassed = MONEY_PERM_BYPASS_USER_IDS.includes(interaction.user.id);
-      const hasPermRole = interaction.member.roles.cache.some((r) => r.name === MONEY_PERM_ROLE_NAME);
-      if (!isBypassed && !hasPermRole) {
+      if (!hasImbPerm(interaction)) {
         await interaction.reply({
           content: `You need the **${MONEY_PERM_ROLE_NAME}** role in this server to set the money supply.`,
           flags: MessageFlags.Ephemeral,
