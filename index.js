@@ -722,7 +722,7 @@ async function registerCommands(clientId) {
       .setDescription('Get the invite link for the IMB server'),
     new SlashCommandBuilder()
       .setName('set-gdp-history')
-      .setDescription(`Set this channel as the default daily GDP update channel for this server (requires ${MONEY_PERM_ROLE_NAME} role)`),
+      .setDescription(truncate(`Set this channel as the daily GDP update channel (requires ${MONEY_PERM_ROLE_NAME} role)`, 100)),
   ].map((c) => c.toJSON());
 
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
