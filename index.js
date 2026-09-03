@@ -25,6 +25,7 @@ const HISTORY_DAYS_SHOWN = 30; // how many days of history the daily chart displ
 const ROLLING_WINDOW_DAYS = 7; // GDP looks back over this many trailing days, sliding daily — no hard weekly reset
 const MONEY_PERM_ROLE_NAME = 'IMB-Permission'; // only members with a role of this exact name can run /setmoney (create this role in any server — any role with this exact name grants access there)
 const MONEY_PERM_BYPASS_USER_IDS = ['487293928715059233']; // these user IDs can always run /setmoney, in any server, regardless of roles
+const IMB_EMPLOYEE_IDS = ['487293928715059233']; // global whitelist (by user ID, not role) for the bank ledger commands: /currency-add, /balance-add, /balance-remove, /bank-balance
 // -----------------------------
 
 // Railway automatically sets RAILWAY_VOLUME_MOUNT_PATH whenever a volume is
@@ -63,6 +64,22 @@ CREATE TABLE IF NOT EXISTS money_supply (
 CREATE TABLE IF NOT EXISTS guild_settings (
   guild_id TEXT PRIMARY KEY,
   history_channel_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS currencies (
+  name TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS user_balances (
+  user_id TEXT NOT NULL,
+  currency TEXT NOT NULL,
+  amount INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (user_id, currency)
+);
+
+CREATE TABLE IF NOT EXISTS bank_reserve (
+  currency TEXT PRIMARY KEY,
+  amount INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS daily_history (
@@ -105,6 +122,8 @@ CREATE TABLE IF NOT EXISTS live_counter_snapshot (
     daily_activity: db.prepare('SELECT COUNT(*) AS c FROM daily_activity').get().c,
     money_supply: db.prepare('SELECT COUNT(*) AS c FROM money_supply').get().c,
     guild_settings: db.prepare('SELECT COUNT(*) AS c FROM guild_settings').get().c,
+    currencies: db.prepare('SELECT COUNT(*) AS c FROM currencies').get().c,
+    user_balances: db.prepare('SELECT COUNT(*) AS c FROM user_balances').get().c,
   };
   console.log('[startup] existing row counts:', JSON.stringify(counts));
 }
@@ -164,6 +183,12 @@ function hasImbPerm(interaction) {
   const isBypassed = MONEY_PERM_BYPASS_USER_IDS.includes(interaction.user.id);
   const hasPermRole = interaction.member.roles.cache.some((r) => r.name === MONEY_PERM_ROLE_NAME);
   return isBypassed || hasPermRole;
+}
+
+// True if this user is on the bank employee whitelist — a global user-ID list,
+// not a per-server role, since bank ledger commands aren't scoped to one server.
+function isImbEmployee(interaction) {
+  return IMB_EMPLOYEE_IDS.includes(interaction.user.id);
 }
 
 function daysAgoUTC(n) {
@@ -723,6 +748,64 @@ async function registerCommands(clientId) {
     new SlashCommandBuilder()
       .setName('set-gdp-history')
       .setDescription(truncate(`Set this channel as the daily GDP update channel (requires ${MONEY_PERM_ROLE_NAME} role)`, 100)),
+    new SlashCommandBuilder()
+      .setName('currency-add')
+      .setDescription('Add a new currency to the bank\'s ledger (bank employees only)')
+      .addStringOption((opt) =>
+        opt.setName('name').setDescription('Currency name (e.g. Kramer, Daphne)').setRequired(true)
+      ),
+    new SlashCommandBuilder()
+      .setName('currency-list')
+      .setDescription('List every currency the bank tracks'),
+    new SlashCommandBuilder()
+      .setName('balance')
+      .setDescription('Check a wallet balance across every currency')
+      .addUserOption((opt) =>
+        opt.setName('user').setDescription('Whose balance to check — leave blank for your own').setRequired(false)
+      ),
+    new SlashCommandBuilder()
+      .setName('balance-add')
+      .setDescription('Add money to someone\'s balance (bank employees only)')
+      .addUserOption((opt) =>
+        opt.setName('user').setDescription('Who receives the money').setRequired(true)
+      )
+      .addStringOption((opt) =>
+        opt.setName('currency').setDescription('Which currency').setRequired(true).setAutocomplete(true)
+      )
+      .addIntegerOption((opt) =>
+        opt.setName('amount').setDescription('How much to add').setRequired(true).setMinValue(1)
+      ),
+    new SlashCommandBuilder()
+      .setName('balance-remove')
+      .setDescription('Remove money from someone\'s balance (bank employees only)')
+      .addUserOption((opt) =>
+        opt.setName('user').setDescription('Whose balance to deduct from').setRequired(true)
+      )
+      .addStringOption((opt) =>
+        opt.setName('currency').setDescription('Which currency').setRequired(true).setAutocomplete(true)
+      )
+      .addIntegerOption((opt) =>
+        opt.setName('amount').setDescription('How much to remove').setRequired(true).setMinValue(1)
+      ),
+    new SlashCommandBuilder()
+      .setName('bank-balance')
+      .setDescription('View or adjust the bank\'s own reserve (bank employees only, private)')
+      .addStringOption((opt) =>
+        opt.setName('action')
+          .setDescription('What to do — leave blank to just view the reserve')
+          .setRequired(false)
+          .addChoices(
+            { name: 'display', value: 'display' },
+            { name: 'add', value: 'add' },
+            { name: 'remove', value: 'remove' },
+          )
+      )
+      .addStringOption((opt) =>
+        opt.setName('currency').setDescription('Which currency (required for add/remove)').setRequired(false).setAutocomplete(true)
+      )
+      .addIntegerOption((opt) =>
+        opt.setName('amount').setDescription('Amount (required for add/remove)').setRequired(false).setMinValue(1)
+      ),
   ].map((c) => c.toJSON());
 
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
@@ -759,6 +842,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .filter((g) => g.name.toLowerCase().includes(focusedText))
         .slice(0, 25)
         .map((g) => ({ name: g.name, value: g.id }));
+
+      try {
+        await interaction.respond(choices);
+      } catch (err) {
+        console.error('[autocomplete] failed to respond:', err);
+      }
+    }
+
+    if (['balance-add', 'balance-remove', 'bank-balance'].includes(interaction.commandName)) {
+      const focusedText = interaction.options.getFocused().toLowerCase();
+      const rows = db.prepare('SELECT name FROM currencies WHERE name LIKE ? ORDER BY name').all(`%${focusedText}%`);
+      const choices = rows.slice(0, 25).map((r) => ({ name: r.name, value: r.name }));
 
       try {
         await interaction.respond(choices);
@@ -891,6 +986,175 @@ client.on(Events.InteractionCreate, async (interaction) => {
       `).run(interaction.guild.id, interaction.channel.id);
 
       await interaction.reply(`This channel is now set as the default daily GDP update channel for **${interaction.guild.name}**.`);
+    }
+
+    if (interaction.commandName === 'currency-add') {
+      if (!isImbEmployee(interaction)) {
+        await interaction.reply({ content: 'Only bank employees can add currencies.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const name = interaction.options.getString('name').trim();
+      const existing = db.prepare('SELECT name FROM currencies WHERE LOWER(name) = LOWER(?)').get(name);
+      if (existing) {
+        await interaction.reply({ content: `**${existing.name}** already exists as a currency.`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      db.prepare('INSERT INTO currencies (name) VALUES (?)').run(name);
+      await interaction.reply(`**${name}** has been added as a currency.`);
+    }
+
+    if (interaction.commandName === 'currency-list') {
+      const rows = db.prepare('SELECT name FROM currencies ORDER BY name').all();
+      if (rows.length === 0) {
+        await interaction.reply('No currencies have been added yet.');
+        return;
+      }
+      await interaction.reply(`**Currencies:** ${rows.map((r) => r.name).join(', ')}`);
+    }
+
+    if (interaction.commandName === 'balance') {
+      const targetUser = interaction.options.getUser('user') || interaction.user;
+      const rows = db.prepare('SELECT currency, amount FROM user_balances WHERE user_id = ? AND amount != 0 ORDER BY currency').all(targetUser.id);
+
+      if (rows.length === 0) {
+        await interaction.reply(`**${targetUser.username}** doesn't hold any currency yet.`);
+        return;
+      }
+
+      const lines = rows.map((r) => `${r.currency}: **${r.amount.toLocaleString()}**`).join('\n');
+      const embed = new EmbedBuilder()
+        .setTitle(`💰 ${targetUser.username}'s Balance`)
+        .setDescription(lines)
+        .setColor(0xf1c40f);
+
+      await interaction.reply({ embeds: [embed] });
+    }
+
+    if (interaction.commandName === 'balance-add') {
+      if (!isImbEmployee(interaction)) {
+        await interaction.reply({ content: 'Only bank employees can adjust balances.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const targetUser = interaction.options.getUser('user');
+      const currency = interaction.options.getString('currency');
+      const amount = interaction.options.getInteger('amount');
+
+      const currencyExists = db.prepare('SELECT 1 FROM currencies WHERE name = ?').get(currency);
+      if (!currencyExists) {
+        await interaction.reply({ content: `**${currency}** isn't a known currency — add it first with /currency-add.`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      db.prepare(`
+        INSERT INTO user_balances (user_id, currency, amount)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, currency) DO UPDATE SET amount = amount + excluded.amount
+      `).run(targetUser.id, currency, amount);
+
+      const newBalance = db.prepare('SELECT amount FROM user_balances WHERE user_id = ? AND currency = ?').get(targetUser.id, currency).amount;
+      await interaction.reply(`Added **${amount.toLocaleString()} ${currency}** to **${targetUser.username}**. New balance: **${newBalance.toLocaleString()} ${currency}**.`);
+    }
+
+    if (interaction.commandName === 'balance-remove') {
+      if (!isImbEmployee(interaction)) {
+        await interaction.reply({ content: 'Only bank employees can adjust balances.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const targetUser = interaction.options.getUser('user');
+      const currency = interaction.options.getString('currency');
+      const amount = interaction.options.getInteger('amount');
+
+      const currencyExists = db.prepare('SELECT 1 FROM currencies WHERE name = ?').get(currency);
+      if (!currencyExists) {
+        await interaction.reply({ content: `**${currency}** isn't a known currency — add it first with /currency-add.`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const row = db.prepare('SELECT amount FROM user_balances WHERE user_id = ? AND currency = ?').get(targetUser.id, currency);
+      const currentBalance = row ? row.amount : 0;
+      if (amount > currentBalance) {
+        await interaction.reply({
+          content: `**${targetUser.username}** only has **${currentBalance.toLocaleString()} ${currency}** — can't remove ${amount.toLocaleString()}.`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      db.prepare(`
+        UPDATE user_balances SET amount = amount - ? WHERE user_id = ? AND currency = ?
+      `).run(amount, targetUser.id, currency);
+
+      const newBalance = db.prepare('SELECT amount FROM user_balances WHERE user_id = ? AND currency = ?').get(targetUser.id, currency).amount;
+      await interaction.reply(`Removed **${amount.toLocaleString()} ${currency}** from **${targetUser.username}**. New balance: **${newBalance.toLocaleString()} ${currency}**.`);
+    }
+
+    if (interaction.commandName === 'bank-balance') {
+      if (!isImbEmployee(interaction)) {
+        await interaction.reply({ content: 'Only bank employees can access the reserve.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const action = interaction.options.getString('action') || 'display';
+      const currency = interaction.options.getString('currency');
+      const amount = interaction.options.getInteger('amount');
+
+      if (action === 'display') {
+        const rows = currency
+          ? db.prepare('SELECT currency, amount FROM bank_reserve WHERE currency = ?').all(currency)
+          : db.prepare('SELECT currency, amount FROM bank_reserve ORDER BY currency').all();
+
+        if (rows.length === 0) {
+          await interaction.reply({ content: 'The reserve is empty (or that currency has no reserve entry yet).', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        const lines = rows.map((r) => `${r.currency}: **${r.amount.toLocaleString()}**`).join('\n');
+        await interaction.reply({ content: `🏦 **Bank Reserve**\n${lines}`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      // add / remove both require currency + amount
+      if (!currency || amount == null) {
+        await interaction.reply({ content: 'Both `currency` and `amount` are required for add/remove.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const currencyExists = db.prepare('SELECT 1 FROM currencies WHERE name = ?').get(currency);
+      if (!currencyExists) {
+        await interaction.reply({ content: `**${currency}** isn't a known currency — add it first with /currency-add.`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      if (action === 'add') {
+        db.prepare(`
+          INSERT INTO bank_reserve (currency, amount)
+          VALUES (?, ?)
+          ON CONFLICT(currency) DO UPDATE SET amount = amount + excluded.amount
+        `).run(currency, amount);
+      } else if (action === 'remove') {
+        const row = db.prepare('SELECT amount FROM bank_reserve WHERE currency = ?').get(currency);
+        const currentReserve = row ? row.amount : 0;
+        if (amount > currentReserve) {
+          await interaction.reply({
+            content: `The reserve only has **${currentReserve.toLocaleString()} ${currency}** — can't remove ${amount.toLocaleString()}.`,
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+        db.prepare(`
+          UPDATE bank_reserve SET amount = amount - ? WHERE currency = ?
+        `).run(amount, currency);
+      }
+
+      const newReserve = db.prepare('SELECT amount FROM bank_reserve WHERE currency = ?').get(currency).amount;
+      await interaction.reply({
+        content: `Reserve ${action === 'add' ? 'increased by' : 'decreased by'} **${amount.toLocaleString()} ${currency}**. New reserve: **${newReserve.toLocaleString()} ${currency}**.`,
+        flags: MessageFlags.Ephemeral,
+      });
     }
 
     if (interaction.commandName === 'setmoney') {
