@@ -26,6 +26,17 @@ const ROLLING_WINDOW_DAYS = 7; // GDP looks back over this many trailing days, s
 const MONEY_PERM_ROLE_NAME = 'IMB-Permission'; // only members with a role of this exact name can run /setmoney (create this role in any server — any role with this exact name grants access there)
 const MONEY_PERM_BYPASS_USER_IDS = ['487293928715059233']; // these user IDs can always run /setmoney, in any server, regardless of roles
 const IMB_EMPLOYEE_IDS = ['487293928715059233']; // global whitelist (by user ID, not role) for the bank ledger commands: /currency-add, /balance-add, /balance-remove, /bank-balance
+
+// Std-Ecu: a synthetic, fixed-value 3rd option selectable in /exchangerate
+// alongside real tracked servers. NOT a real currency-ledger entry — it never
+// touches the `currencies` table and has no /convert command. It exists purely
+// as a fixed reference point for the exchange-rate command. Value is pinned to
+// K_CONSTANT (the one number in the whole system that's truly static — only
+// changes via code edit) rather than any live/measured GDP figure, so it can
+// never drift.
+const STD_ECU_ID = 'STD_ECU';
+const STD_ECU_VALUE = 0.001 * K_CONSTANT;
+const STD_ECU_LABEL = 'Std-Ecu (fixed value)';
 // -----------------------------
 
 // Railway automatically sets RAILWAY_VOLUME_MOUNT_PATH whenever a volume is
@@ -222,6 +233,25 @@ function computeGDP({ messages, activeMembers, totalMembers, newJoins }) {
   // GDP = k * rolling_7day_messages * (1 + rolling_7day_new_joins / total_members)
   const growthModifier = 1 + (totalMembers > 0 ? newJoins / totalMembers : 0);
   return K_CONSTANT * messages * growthModifier;
+}
+
+// Resolves the value-per-unit for one side of an /exchangerate comparison,
+// given an id that's either a real tracked guild id or the synthetic STD_ECU_ID.
+// Std-Ecu never needs a snapshot or a money supply — its value is a flat
+// constant — so it short-circuits before any of the guild-snapshot lookups.
+function resolveValuePerUnit(id) {
+  if (id === STD_ECU_ID) return { ok: true, value: STD_ECU_VALUE };
+  const snap = latestSnapshot(id);
+  if (!snap) return { ok: false, reason: 'no-snapshot' };
+  if (!snap.money_supply) return { ok: false, reason: 'no-money-supply' };
+  return { ok: true, value: snap.gdp / snap.money_supply };
+}
+
+// Resolves the display name for one side of an /exchangerate comparison.
+function resolveDisplayName(id) {
+  if (id === STD_ECU_ID) return 'Std-Ecu';
+  const g = client.guilds.cache.get(id);
+  return g ? g.name : id;
 }
 
 const client = new Client({
@@ -729,16 +759,16 @@ async function registerCommands(clientId) {
       ),
     new SlashCommandBuilder()
       .setName('exchangerate')
-      .setDescription('Estimate an exchange rate between two tracked servers')
+      .setDescription('Estimate an exchange rate between two tracked servers (or Std-Ecu)')
       .addStringOption((opt) =>
         opt.setName('target_guild')
-          .setDescription('The first server (start typing to pick from a list)')
+          .setDescription('The first server or Std-Ecu (start typing to pick from a list)')
           .setRequired(true)
           .setAutocomplete(true)
       )
       .addStringOption((opt) =>
         opt.setName('source_guild')
-          .setDescription('The second server — leave blank to use the server you\'re in right now')
+          .setDescription('The second server or Std-Ecu — leave blank to use the server you\'re in right now')
           .setRequired(false)
           .setAutocomplete(true)
       ),
@@ -819,15 +849,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const focusedText = focusedOption.value.toLowerCase();
 
       // Whatever's already typed/picked in the OTHER field, so we can avoid suggesting
-      // the same server for both sides of the comparison.
+      // the same server (or Std-Ecu) for both sides of the comparison.
       const otherFieldName = focusedOption.name === 'target_guild' ? 'source_guild' : 'target_guild';
       const otherValue = interaction.options.getString(otherFieldName);
 
-      const choices = [...client.guilds.cache.values()]
+      const guildChoices = [...client.guilds.cache.values()]
         .filter((g) => g.id !== otherValue)
         .filter((g) => g.name.toLowerCase().includes(focusedText))
         .slice(0, 25) // Discord's max autocomplete results
         .map((g) => ({ name: g.name, value: g.id }));
+
+      // Inject the synthetic Std-Ecu choice alongside real guilds, filtered by the
+      // same typed text, on both the target_guild and source_guild fields — same
+      // list either side, since a user might want Std-Ecu on either end.
+      const stdEcuMatches = otherValue !== STD_ECU_ID && STD_ECU_LABEL.toLowerCase().includes(focusedText);
+      const choices = stdEcuMatches
+        ? [{ name: STD_ECU_LABEL, value: STD_ECU_ID }, ...guildChoices].slice(0, 25)
+        : guildChoices;
 
       try {
         await interaction.respond(choices);
@@ -1185,34 +1223,32 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const sourceId = interaction.options.getString('source_guild') || interaction.guild.id;
 
       if (sourceId === targetId) {
-        await interaction.reply('Pick two different servers to compare — both fields point to the same one right now.');
+        await interaction.reply('Pick two different servers (or Std-Ecu) to compare — both fields point to the same thing right now.');
         return;
       }
 
-      const a = latestSnapshot(sourceId);
-      const b = latestSnapshot(targetId);
+      const a = resolveValuePerUnit(sourceId);
+      const b = resolveValuePerUnit(targetId);
 
-      if (!a || !b) {
-        await interaction.reply('Missing a snapshot for one of the two servers — try /gdp or /setmoney in that server first to generate one.');
+      if (!a.ok || !b.ok) {
+        const badSide = !a.ok ? sourceId : targetId;
+        const badResult = !a.ok ? a : b;
+        const badName = resolveDisplayName(badSide);
+        if (badResult.reason === 'no-snapshot') {
+          await interaction.reply(`Missing a snapshot for **${badName}** — try /gdp or /setmoney in that server first to generate one.`);
+        } else {
+          await interaction.reply(`**${badName}** needs a money supply set via /setmoney before an exchange rate can be computed.`);
+        }
         return;
       }
-      if (!a.money_supply || !b.money_supply) {
-        await interaction.reply('Both servers need a money supply set via /setmoney before an exchange rate can be computed.');
-        return;
-      }
 
-      const valuePerUnitA = a.gdp / a.money_supply;
-      const valuePerUnitB = b.gdp / b.money_supply;
-      const rate = valuePerUnitA / valuePerUnitB; // 1 unit of A currency = `rate` units of B currency
+      const rate = a.value / b.value; // 1 unit of source = `rate` units of target
 
-      const sourceGuild = client.guilds.cache.get(sourceId);
-      const targetGuild = client.guilds.cache.get(targetId);
-      const sourceName = sourceGuild ? sourceGuild.name : sourceId;
-      const targetName = targetGuild ? targetGuild.name : targetId;
+      const sourceName = resolveDisplayName(sourceId);
+      const targetName = resolveDisplayName(targetId);
 
       await interaction.reply(
-        `Estimated exchange rate: **1 currency unit in ${sourceName} ≈ ${rate.toFixed(4)} currency units in ${targetName}** ` +
-        `(based on last snapshot: GDP ${a.gdp.toFixed(1)} vs ${b.gdp.toFixed(1)}, money supply ${a.money_supply} vs ${b.money_supply}).`
+        `Estimated exchange rate: **1 currency unit in ${sourceName} ≈ ${rate.toFixed(4)} currency units in ${targetName}**.`
       );
     }
   } catch (err) {
