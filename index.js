@@ -25,7 +25,7 @@ const HISTORY_DAYS_SHOWN = 30; // how many days of history the daily chart displ
 const ROLLING_WINDOW_DAYS = 7; // GDP looks back over this many trailing days, sliding daily — no hard weekly reset
 const MONEY_PERM_ROLE_NAME = 'IMB-Permission'; // only members with a role of this exact name can run /setmoney (create this role in any server — any role with this exact name grants access there)
 const MONEY_PERM_BYPASS_USER_IDS = ['487293928715059233']; // these user IDs can always run /setmoney, in any server, regardless of roles
-const IMB_EMPLOYEE_IDS = ['487293928715059233']; // global whitelist (by user ID, not role) for the bank ledger commands: /currency-add, /balance-add, /balance-remove, /bank-balance
+const IMB_EMPLOYEE_IDS = ['487293928715059233']; // global whitelist (by user ID, not role) for the bank ledger commands: /currency-add, /currency-modify, /balance-add, /balance-remove, /bank-balance
 
 // Std-Ecu: a synthetic, fixed-value 3rd option selectable in /exchangerate
 // alongside real tracked servers. NOT a real currency-ledger entry — it never
@@ -788,6 +788,24 @@ async function registerCommands(clientId) {
       .setName('currency-list')
       .setDescription('List every currency the bank tracks'),
     new SlashCommandBuilder()
+      .setName('currency-modify')
+      .setDescription('Rename or delete a currency (bank employees only)')
+      .addStringOption((opt) =>
+        opt.setName('currency').setDescription('Which currency').setRequired(true).setAutocomplete(true)
+      )
+      .addStringOption((opt) =>
+        opt.setName('action')
+          .setDescription('rename or delete')
+          .setRequired(true)
+          .addChoices(
+            { name: 'rename', value: 'rename' },
+            { name: 'delete', value: 'delete' },
+          )
+      )
+      .addStringOption((opt) =>
+        opt.setName('new_name').setDescription('New name (required for rename)').setRequired(false)
+      ),
+    new SlashCommandBuilder()
       .setName('balance')
       .setDescription('Check a wallet balance across every currency')
       .addUserOption((opt) =>
@@ -888,7 +906,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
 
-    if (['balance-add', 'balance-remove', 'bank-balance'].includes(interaction.commandName)) {
+    if (['balance-add', 'balance-remove', 'bank-balance', 'currency-modify'].includes(interaction.commandName)) {
       const focusedText = interaction.options.getFocused().toLowerCase();
       const rows = db.prepare('SELECT name FROM currencies WHERE name LIKE ? ORDER BY name').all(`%${focusedText}%`);
       const choices = rows.slice(0, 25).map((r) => ({ name: r.name, value: r.name }));
@@ -1050,6 +1068,81 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
       await interaction.reply(`**Currencies:** ${rows.map((r) => r.name).join(', ')}`);
+    }
+
+    if (interaction.commandName === 'currency-modify') {
+      if (!isImbEmployee(interaction)) {
+        await interaction.reply({ content: 'Only bank employees can rename or delete currencies.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const currencyInput = interaction.options.getString('currency');
+      const action = interaction.options.getString('action');
+      const newNameInput = interaction.options.getString('new_name');
+
+      const existing = db.prepare('SELECT name FROM currencies WHERE name = ?').get(currencyInput);
+      if (!existing) {
+        await interaction.reply({ content: `**${currencyInput}** isn't a known currency — check /currency-list.`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      if (action === 'rename') {
+        const newName = (newNameInput || '').trim();
+        if (!newName) {
+          await interaction.reply({ content: '`new_name` is required for the rename action.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        if (newName.toLowerCase() !== existing.name.toLowerCase()) {
+          const clash = db.prepare('SELECT name FROM currencies WHERE LOWER(name) = LOWER(?)').get(newName);
+          if (clash) {
+            await interaction.reply({ content: `**${clash.name}** already exists as a currency — pick a different name.`, flags: MessageFlags.Ephemeral });
+            return;
+          }
+        }
+
+        // Rename atomically everywhere the old name is referenced (currencies,
+        // every wallet holding it, and the bank's own reserve) so nothing is
+        // left pointing at a name that no longer exists in `currencies`.
+        const renameEverywhere = db.transaction((oldName, updatedName) => {
+          db.prepare('UPDATE currencies SET name = ? WHERE name = ?').run(updatedName, oldName);
+          db.prepare('UPDATE user_balances SET currency = ? WHERE currency = ?').run(updatedName, oldName);
+          db.prepare('UPDATE bank_reserve SET currency = ? WHERE currency = ?').run(updatedName, oldName);
+        });
+        renameEverywhere(existing.name, newName);
+
+        await interaction.reply(`**${existing.name}** has been renamed to **${newName}** (wallets and the bank reserve were updated to match).`);
+        return;
+      }
+
+      if (action === 'delete') {
+        // Safety net: refuse to delete a currency that's still actively holding
+        // value anywhere, rather than silently wiping wallets/reserve. Employees
+        // need to zero those out first via /balance-remove and /bank-balance.
+        const holderCount = db.prepare(
+          'SELECT COUNT(*) AS c FROM user_balances WHERE currency = ? AND amount != 0'
+        ).get(existing.name).c;
+        const reserveRow = db.prepare('SELECT amount FROM bank_reserve WHERE currency = ?').get(existing.name);
+        const reserveAmount = reserveRow ? reserveRow.amount : 0;
+
+        if (holderCount > 0 || reserveAmount !== 0) {
+          await interaction.reply({
+            content: `Can't delete **${existing.name}** — it's still held by **${holderCount}** wallet(s) and/or has a bank reserve of **${reserveAmount.toLocaleString()}**. Zero those out first with /balance-remove and /bank-balance, then try again.`,
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        const deleteEverywhere = db.transaction((name) => {
+          db.prepare('DELETE FROM currencies WHERE name = ?').run(name);
+          db.prepare('DELETE FROM user_balances WHERE currency = ?').run(name); // only zero-balance rows can remain at this point
+          db.prepare('DELETE FROM bank_reserve WHERE currency = ?').run(name);
+        });
+        deleteEverywhere(existing.name);
+
+        await interaction.reply(`**${existing.name}** has been deleted.`);
+        return;
+      }
     }
 
     if (interaction.commandName === 'balance') {
