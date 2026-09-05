@@ -271,12 +271,29 @@ function resolveValuePerUnit(id) {
 // currency's name instead of the server's own name — the point being you
 // pick the server as usual in the autocomplete, and the currency label just
 // appears automatically, without needing a separate pickable entry for it.
+// Used for naming a side in error messages, where a short name reads best.
 function resolveDisplayName(id) {
   if (id === STD_ECU_ID) return 'Std-Ecu';
   const linked = db.prepare('SELECT name FROM currencies WHERE linked_guild_id = ?').get(id);
   if (linked) return linked.name;
   const g = client.guilds.cache.get(id);
   return g ? g.name : id;
+}
+
+// Builds the fuller label used inside the /exchangerate result sentence
+// itself. A linked currency shows as "<CurrencyName> in <ServerName>" so both
+// the currency and the server it's tied to stay visible in the same line —
+// unlike resolveDisplayName(), which drops the server name once a currency is
+// linked. Std-Ecu and unlinked servers keep the original "currency unit in
+// <ServerName>" phrasing (Std-Ecu shortens further, since it isn't tied to
+// any server at all).
+function resolveExchangeLabel(id) {
+  if (id === STD_ECU_ID) return 'Std-Ecu';
+  const guild = client.guilds.cache.get(id);
+  const guildName = guild ? guild.name : id;
+  const linked = db.prepare('SELECT name FROM currencies WHERE linked_guild_id = ?').get(id);
+  if (linked) return `${linked.name} in ${guildName}`;
+  return `currency unit in ${guildName}`;
 }
 
 const client = new Client({
@@ -1466,11 +1483,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const rate = a.value / b.value; // 1 unit of source = `rate` units of target
 
-      const sourceName = resolveDisplayName(sourceId);
-      const targetName = resolveDisplayName(targetId);
+      const sourceLabel = resolveExchangeLabel(sourceId);
+      const targetLabel = resolveExchangeLabel(targetId);
 
       await interaction.reply(
-        `Estimated exchange rate: **1 currency unit in ${sourceName} ≈ ${rate.toFixed(4)} currency units in ${targetName}**.`
+        `Estimated exchange rate: **1 ${sourceLabel} ≈ ${rate.toFixed(4)} ${targetLabel}**.`
       );
     }
   } catch (err) {
