@@ -25,7 +25,7 @@ const HISTORY_DAYS_SHOWN = 30; // how many days of history the daily chart displ
 const ROLLING_WINDOW_DAYS = 7; // GDP looks back over this many trailing days, sliding daily — no hard weekly reset
 const MONEY_PERM_ROLE_NAME = 'IMB-Permission'; // only members with a role of this exact name can run /setmoney (create this role in any server — any role with this exact name grants access there)
 const MONEY_PERM_BYPASS_USER_IDS = ['487293928715059233']; // these user IDs can always run /setmoney, in any server, regardless of roles
-const IMB_EMPLOYEE_IDS = ['487293928715059233']; // global whitelist (by user ID, not role) for the bank ledger commands: /currency-add, /currency-modify, /balance-add, /balance-remove, /bank-balance
+const IMB_EMPLOYEE_IDS = ['487293928715059233']; // global whitelist (by user ID, not role) for the bank ledger commands: /currency-add, /currency-modify, /currency-link, /balance-add, /balance-remove, /bank-balance
 
 // Std-Ecu: a synthetic, fixed-value 3rd option selectable in /exchangerate
 // alongside real tracked servers. NOT a real currency-ledger entry — it never
@@ -120,6 +120,25 @@ CREATE TABLE IF NOT EXISTS live_counter_snapshot (
   new_joins INTEGER NOT NULL,
   active_senders TEXT NOT NULL
 );
+`);
+
+// Migration: add linked_guild_id to `currencies` for servers that already had
+// the table from before /currency-link existed. ALTER TABLE ADD COLUMN throws
+// if the column is already there, so that specific error is swallowed and any
+// other error is rethrown — a fresh install never hits the throw at all since
+// the CREATE TABLE above doesn't declare this column.
+try {
+  db.exec('ALTER TABLE currencies ADD COLUMN linked_guild_id TEXT');
+} catch (err) {
+  if (!/duplicate column name/i.test(err.message)) throw err;
+}
+
+// At most one currency can be linked to a given server at a time — otherwise
+// /exchangerate would have no way to pick which currency name to show for
+// that server. NULLs are excluded so any number of currencies can sit unlinked.
+db.exec(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_currencies_linked_guild
+  ON currencies(linked_guild_id) WHERE linked_guild_id IS NOT NULL
 `);
 
 // Diagnostic: log how much pre-existing data was found in the database at startup.
@@ -247,9 +266,15 @@ function resolveValuePerUnit(id) {
   return { ok: true, value: snap.gdp / snap.money_supply };
 }
 
-// Resolves the display name for one side of an /exchangerate comparison.
+// Resolves the display name for one side of an /exchangerate comparison. A
+// server that has a currency linked to it (via /currency-link) shows that
+// currency's name instead of the server's own name — the point being you
+// pick the server as usual in the autocomplete, and the currency label just
+// appears automatically, without needing a separate pickable entry for it.
 function resolveDisplayName(id) {
   if (id === STD_ECU_ID) return 'Std-Ecu';
+  const linked = db.prepare('SELECT name FROM currencies WHERE linked_guild_id = ?').get(id);
+  if (linked) return linked.name;
   const g = client.guilds.cache.get(id);
   return g ? g.name : id;
 }
@@ -806,6 +831,27 @@ async function registerCommands(clientId) {
         opt.setName('new_name').setDescription('New name (required for rename)').setRequired(false)
       ),
     new SlashCommandBuilder()
+      .setName('currency-link')
+      .setDescription('Link/unlink a currency to a server, shown by /exchangerate (employees only)')
+      .addStringOption((opt) =>
+        opt.setName('currency').setDescription('Which currency').setRequired(true).setAutocomplete(true)
+      )
+      .addStringOption((opt) =>
+        opt.setName('action')
+          .setDescription('add or remove the link')
+          .setRequired(true)
+          .addChoices(
+            { name: 'add', value: 'add' },
+            { name: 'remove', value: 'remove' },
+          )
+      )
+      .addStringOption((opt) =>
+        opt.setName('guild')
+          .setDescription('Server to link to (required for add, ignored for remove)')
+          .setRequired(false)
+          .setAutocomplete(true)
+      ),
+    new SlashCommandBuilder()
       .setName('balance')
       .setDescription('Check a wallet balance across every currency')
       .addUserOption((opt) =>
@@ -910,6 +956,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const focusedText = interaction.options.getFocused().toLowerCase();
       const rows = db.prepare('SELECT name FROM currencies WHERE name LIKE ? ORDER BY name').all(`%${focusedText}%`);
       const choices = rows.slice(0, 25).map((r) => ({ name: r.name, value: r.name }));
+
+      try {
+        await interaction.respond(choices);
+      } catch (err) {
+        console.error('[autocomplete] failed to respond:', err);
+      }
+    }
+
+    if (interaction.commandName === 'currency-link') {
+      // Two different fields need two different suggestion lists, so branch on
+      // which one the user is actually typing in right now.
+      const focusedOption = interaction.options.getFocused(true); // { name, value }
+      const focusedText = focusedOption.value.toLowerCase();
+      let choices = [];
+
+      if (focusedOption.name === 'currency') {
+        const rows = db.prepare('SELECT name FROM currencies WHERE name LIKE ? ORDER BY name').all(`%${focusedText}%`);
+        choices = rows.slice(0, 25).map((r) => ({ name: r.name, value: r.name }));
+      } else if (focusedOption.name === 'guild') {
+        choices = [...client.guilds.cache.values()]
+          .filter((g) => g.name.toLowerCase().includes(focusedText))
+          .slice(0, 25)
+          .map((g) => ({ name: g.name, value: g.id }));
+      }
 
       try {
         await interaction.respond(choices);
@@ -1141,6 +1211,65 @@ client.on(Events.InteractionCreate, async (interaction) => {
         deleteEverywhere(existing.name);
 
         await interaction.reply(`**${existing.name}** has been deleted.`);
+        return;
+      }
+    }
+
+    if (interaction.commandName === 'currency-link') {
+      if (!isImbEmployee(interaction)) {
+        await interaction.reply({ content: 'Only bank employees can link or unlink currencies.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      const action = interaction.options.getString('action');
+      const currencyInput = interaction.options.getString('currency');
+      const guildId = interaction.options.getString('guild');
+
+      const existing = db.prepare('SELECT name, linked_guild_id FROM currencies WHERE name = ?').get(currencyInput);
+      if (!existing) {
+        await interaction.reply({ content: `**${currencyInput}** isn't a known currency — check /currency-list.`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      if (action === 'add') {
+        if (!guildId) {
+          await interaction.reply({ content: '`guild` is required for the add action.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        const guild = client.guilds.cache.get(guildId);
+        if (!guild) {
+          await interaction.reply({ content: "I'm not tracking a server with that ID — pick one from the autocomplete list.", flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        // Only one currency can be linked to a given server at a time (enforced
+        // by the unique index too) — otherwise /exchangerate wouldn't know which
+        // currency name to show for that server.
+        const clash = db.prepare('SELECT name FROM currencies WHERE linked_guild_id = ? AND name != ?').get(guildId, existing.name);
+        if (clash) {
+          await interaction.reply({
+            content: `**${guild.name}** is already linked to **${clash.name}** — remove that link first (\`/currency-link action:remove currency:${clash.name}\`).`,
+            flags: MessageFlags.Ephemeral,
+          });
+          return;
+        }
+
+        db.prepare('UPDATE currencies SET linked_guild_id = ? WHERE name = ?').run(guildId, existing.name);
+        await interaction.reply(
+          `**${existing.name}** is now linked to **${guild.name}** — /exchangerate will show it as **${existing.name}** instead of the server name whenever that server is picked.`
+        );
+        return;
+      }
+
+      if (action === 'remove') {
+        if (!existing.linked_guild_id) {
+          await interaction.reply({ content: `**${existing.name}** isn't linked to a server.`, flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        db.prepare('UPDATE currencies SET linked_guild_id = NULL WHERE name = ?').run(existing.name);
+        await interaction.reply(`**${existing.name}** is no longer linked to a server.`);
         return;
       }
     }
